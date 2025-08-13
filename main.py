@@ -1,6 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
@@ -19,9 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Security
-security = HTTPBearer()
-
 # MongoDB Configuration
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb+srv://satya:satya@cluster0.8thgg4a.mongodb.net")
 DATABASE_NAME = "personal_care_app"
@@ -30,18 +26,14 @@ DATABASE_NAME = "personal_care_app"
 client = None
 database = None
 
-@app.on_event("startup")
-async def startup_event():
+async def get_database():
+    """Get database connection, create if not exists"""
     global client, database
-    client = AsyncIOMotorClient(MONGODB_URL)
-    database = client[DATABASE_NAME]
-    print("Connected to MongoDB")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if client:
-        client.close()
-        print("Disconnected from MongoDB")
+    if client is None:
+        client = AsyncIOMotorClient(MONGODB_URL)
+        database = client[DATABASE_NAME]
+        print("Connected to MongoDB")
+    return database
 
 # Pydantic Models
 class UserModel(BaseModel):
@@ -75,21 +67,6 @@ class RestoreDataResponse(BaseModel):
     schedules: List[ScheduleModel]
     backup_date: str
 
-# Helper Functions
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """
-    Verify API token. In production, implement proper JWT validation.
-    For now, we'll use a simple API key check.
-    """
-    expected_token = os.getenv("API_KEY", "pcare_api_key_2024")
-    if credentials.credentials != expected_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return credentials.credentials
-
 # API Routes
 @app.get("/")
 async def root():
@@ -97,11 +74,11 @@ async def root():
 
 @app.post("/backup")
 async def backup_user_data(
-    backup_data: BackupDataModel,
-    token: str = Depends(verify_token)
+    backup_data: BackupDataModel
 ):
     """Backup user data to MongoDB"""
     try:
+        db = await get_database()
         # Create backup document
         backup_doc = {
             "user_id": backup_data.user.id,
@@ -112,7 +89,7 @@ async def backup_user_data(
         }
         
         # Insert or update backup
-        result = await database.backups.replace_one(
+        result = await db.backups.replace_one(
             {"user_id": backup_data.user.id},
             backup_doc,
             upsert=True
@@ -128,12 +105,12 @@ async def backup_user_data(
 
 @app.get("/restore/{user_id}", response_model=RestoreDataResponse)
 async def restore_user_data(
-    user_id: str,
-    token: str = Depends(verify_token)
+    user_id: str
 ):
     """Restore user data from MongoDB"""
     try:
-        backup_doc = await database.backups.find_one({"user_id": user_id})
+        db = await get_database()
+        backup_doc = await db.backups.find_one({"user_id": user_id})
         
         if not backup_doc:
             raise HTTPException(status_code=404, detail="No backup found for this user")
@@ -150,15 +127,15 @@ async def restore_user_data(
 
 @app.post("/schedules")
 async def create_or_update_schedule(
-    schedule: ScheduleModel,
-    token: str = Depends(verify_token)
+    schedule: ScheduleModel
 ):
     """Create or update a schedule in MongoDB"""
     try:
+        db = await get_database()
         schedule_doc = schedule.dict()
         schedule_doc["created_at"] = datetime.utcnow()
         
-        result = await database.schedules.replace_one(
+        result = await db.schedules.replace_one(
             {"id": schedule.id},
             schedule_doc,
             upsert=True
@@ -174,12 +151,12 @@ async def create_or_update_schedule(
 
 @app.get("/schedules/{user_id}")
 async def get_user_schedules(
-    user_id: str,
-    token: str = Depends(verify_token)
+    user_id: str
 ):
     """Get all schedules for a user from MongoDB"""
     try:
-        schedules_cursor = database.schedules.find({"user_id": user_id})
+        db = await get_database()
+        schedules_cursor = db.schedules.find({"user_id": user_id})
         schedules = await schedules_cursor.to_list(length=None)
         
         # Convert MongoDB documents to ScheduleModel format
@@ -194,12 +171,12 @@ async def get_user_schedules(
 
 @app.delete("/schedules/{schedule_id}")
 async def delete_schedule(
-    schedule_id: str,
-    token: str = Depends(verify_token)
+    schedule_id: str
 ):
     """Delete a schedule from MongoDB"""
     try:
-        result = await database.schedules.delete_one({"id": schedule_id})
+        db = await get_database()
+        result = await db.schedules.delete_one({"id": schedule_id})
         
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Schedule not found")
@@ -219,7 +196,8 @@ async def health_check():
     """Health check endpoint"""
     try:
         # Test database connection
-        await database.command("ping")
+        db = await get_database()
+        await db.command("ping")
         return {
             "status": "healthy",
             "database": "connected",
