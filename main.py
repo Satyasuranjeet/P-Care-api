@@ -4,8 +4,14 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 import os
+import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Personal Care API", version="1.0.0")
 
@@ -26,13 +32,33 @@ DATABASE_NAME = "personal_care_app"
 client = None
 database = None
 
-async def get_database():
-    """Get database connection, create if not exists"""
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database connection on startup"""
     global client, database
-    if client is None:
-        client = AsyncIOMotorClient(MONGODB_URL)
+    try:
+        client = AsyncIOMotorClient(MONGODB_URL, maxPoolSize=10, minPoolSize=1)
         database = client[DATABASE_NAME]
-        print("Connected to MongoDB")
+        # Test connection
+        await database.command("ping")
+        logger.info("Successfully connected to MongoDB")
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {e}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close database connection on shutdown"""
+    global client
+    if client:
+        client.close()
+        logger.info("MongoDB connection closed")
+
+async def get_database():
+    """Get database connection"""
+    global database
+    if database is None:
+        raise HTTPException(status_code=503, detail="Database not available")
     return database
 
 # Pydantic Models
@@ -85,7 +111,8 @@ async def backup_user_data(
             "user": backup_data.user.dict(),
             "schedules": [schedule.dict() for schedule in backup_data.schedules],
             "backup_date": backup_data.backup_date,
-            "created_at": datetime.utcnow()
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
         }
         
         # Insert or update backup
@@ -95,12 +122,15 @@ async def backup_user_data(
             upsert=True
         )
         
+        logger.info(f"Data backed up for user {backup_data.user.id}")
         return {
             "success": True,
             "message": "Data backed up successfully",
-            "backup_id": str(result.upserted_id) if result.upserted_id else "updated"
+            "backup_id": str(result.upserted_id) if result.upserted_id else "updated",
+            "user_id": backup_data.user.id
         }
     except Exception as e:
+        logger.error(f"Backup failed for user {backup_data.user.id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
 
 @app.get("/restore/{user_id}", response_model=RestoreDataResponse)
@@ -113,8 +143,10 @@ async def restore_user_data(
         backup_doc = await db.backups.find_one({"user_id": user_id})
         
         if not backup_doc:
+            logger.warning(f"No backup found for user {user_id}")
             raise HTTPException(status_code=404, detail="No backup found for this user")
         
+        logger.info(f"Data restored for user {user_id}")
         return RestoreDataResponse(
             user=UserModel(**backup_doc["user"]),
             schedules=[ScheduleModel(**schedule) for schedule in backup_doc["schedules"]],
@@ -123,6 +155,7 @@ async def restore_user_data(
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Restore failed for user {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Restore failed: {str(e)}")
 
 @app.post("/schedules")
@@ -133,7 +166,14 @@ async def create_or_update_schedule(
     try:
         db = await get_database()
         schedule_doc = schedule.dict()
-        schedule_doc["created_at"] = datetime.utcnow()
+        schedule_doc["updated_at"] = datetime.utcnow().isoformat()
+        
+        # Ensure we don't lose the original created_at if updating
+        existing = await db.schedules.find_one({"id": schedule.id})
+        if existing:
+            schedule_doc["created_at"] = existing.get("created_at", datetime.utcnow().isoformat())
+        else:
+            schedule_doc["created_at"] = datetime.utcnow().isoformat()
         
         result = await db.schedules.replace_one(
             {"id": schedule.id},
@@ -141,12 +181,14 @@ async def create_or_update_schedule(
             upsert=True
         )
         
+        logger.info(f"Schedule {schedule.id} synced successfully")
         return {
             "success": True,
             "message": "Schedule synced successfully",
             "schedule_id": schedule.id
         }
     except Exception as e:
+        logger.error(f"Schedule sync failed for {schedule.id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Schedule sync failed: {str(e)}")
 
 @app.get("/schedules/{user_id}")
@@ -163,10 +205,16 @@ async def get_user_schedules(
         schedule_models = []
         for schedule in schedules:
             schedule.pop("_id", None)  # Remove MongoDB _id field
-            schedule_models.append(ScheduleModel(**schedule))
+            try:
+                schedule_models.append(ScheduleModel(**schedule))
+            except Exception as e:
+                logger.warning(f"Skipping invalid schedule document: {e}")
+                continue
         
+        logger.info(f"Retrieved {len(schedule_models)} schedules for user {user_id}")
         return schedule_models
     except Exception as e:
+        logger.error(f"Failed to get schedules for user {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get schedules: {str(e)}")
 
 @app.delete("/schedules/{schedule_id}")
@@ -179,8 +227,10 @@ async def delete_schedule(
         result = await db.schedules.delete_one({"id": schedule_id})
         
         if result.deleted_count == 0:
+            logger.warning(f"Schedule {schedule_id} not found for deletion")
             raise HTTPException(status_code=404, detail="Schedule not found")
         
+        logger.info(f"Schedule {schedule_id} deleted successfully")
         return {
             "success": True,
             "message": "Schedule deleted successfully",
@@ -189,6 +239,7 @@ async def delete_schedule(
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Failed to delete schedule {schedule_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete schedule: {str(e)}")
 
 @app.get("/health")
@@ -198,10 +249,12 @@ async def health_check():
         # Test database connection
         db = await get_database()
         await db.command("ping")
+        logger.info("Health check passed")
         return {
             "status": "healthy",
             "database": "connected",
-            "timestamp": datetime.utcnow()
+            "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
         raise HTTPException(status_code=503, detail=f"Database connection failed: {str(e)}")
